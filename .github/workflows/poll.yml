@@ -1,0 +1,36 @@
+name: Poll flight prices
+
+on:
+  schedule:
+    # 03:00 UTC daily (~08:30 IST). GitHub Actions cron can run a few minutes
+    # late under load — fine for a once-a-day personal job.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: flysmart-backend
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        working-directory: flysmart-backend
+        run: bun run build
+
+      - name: Run poll
+        working-directory: flysmart-backend
+        run: node dist/scripts/poll.js
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
