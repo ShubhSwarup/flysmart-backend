@@ -18,15 +18,12 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        working-directory: flysmart-backend
         run: bun install --frozen-lockfile
 
       - name: Build
-        working-directory: flysmart-backend
         run: bun run build
 
       - name: Run poll
-        working-directory: flysmart-backend
         run: node dist/scripts/poll.js
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
