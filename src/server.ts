@@ -1,16 +1,38 @@
 import express from "express";
+import cors from "cors";
 import { env } from "./config/env.js";
 import { connectDB } from "./config/db.js";
+import { tripsRouter } from "./api/trips.js";
+import { observationsRouter } from "./api/observations.js";
+import { settingsRouter } from "./api/settings.js";
 
-// Minimal skeleton for Phase 1 (MASTER_SPEC Section 16) — proves the
-// Express + Mongoose wiring works. Trip/observation CRUD routes land in
-// Phase 3 once the frontend is ready to consume a real API.
+// A transient MongoDB hiccup (e.g. Atlas dropping an idle connection) can
+// surface as an unhandled rejection from the driver's internal reconnect
+// logic, which crashes the whole process by Node's default behavior — for
+// a long-running server this turns "the DB blipped for a second" into
+// "the entire API is down until someone notices and restarts it." Log and
+// keep running instead; Mongoose's own connection handling retries queries
+// once the connection recovers.
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection (server staying up):", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception (server staying up):", err);
+});
+
+// Phase 3 (MASTER_SPEC Section 16): the real API the frontend's
+// StoreProvider is migrated onto, screen by screen.
 const app = express();
+app.use(cors()); // single-user personal tool — no origin whitelist needed
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
+
+app.use("/api/trips", tripsRouter);
+app.use("/api/observations", observationsRouter);
+app.use("/api/settings", settingsRouter);
 
 async function start(): Promise<void> {
   await connectDB();

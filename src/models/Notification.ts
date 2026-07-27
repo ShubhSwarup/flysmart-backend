@@ -6,6 +6,7 @@ const notificationSchema = new Schema({
   type: {
     type: String,
     enum: [
+      "baseline_established",
       "new_low",
       "budget_reached",
       "route_historic_low",

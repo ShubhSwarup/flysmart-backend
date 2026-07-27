@@ -9,10 +9,16 @@ export function makeRouteKey(origin: string, destinationAirport: string, cabinCl
   return `${origin}-${destinationAirport}-${cabinClass}`;
 }
 
+// Inverse of makeRouteKey's middle segment. Safe because origin/destination
+// airport codes are always exactly 3 letters with no hyphens, and cabinClass
+// values use underscores (e.g. "premium_economy"), never hyphens.
+export function airportFromRouteKey(routeKey: string): string {
+  return routeKey.split("-").slice(1, -1).join("-");
+}
+
 interface RecordObservationsInput {
   tripId: Types.ObjectId | null;
   origin: string;
-  destinationAirport: string;
   departureDate: string;
   returnDate?: string;
   cabinClass: string;
@@ -23,12 +29,12 @@ interface RecordObservationsInput {
 export async function recordObservations(input: RecordObservationsInput) {
   if (input.itineraries.length === 0) return [];
 
-  const routeKey = makeRouteKey(input.origin, input.destinationAirport, input.cabinClass);
-
   const docs = await Promise.all(
     input.itineraries.map(async (it) => ({
       tripId: input.tripId,
-      routeKey,
+      // Derived per itinerary, not once for the whole batch — a combined
+      // multi-airport search returns itineraries to different airports.
+      routeKey: makeRouteKey(input.origin, it.arrivalAirport, input.cabinClass),
       source: input.source,
       queriedAt: new Date(),
       departureDate: new Date(input.departureDate),

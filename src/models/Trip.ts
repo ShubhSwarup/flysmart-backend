@@ -43,6 +43,10 @@ const tripSchema = new Schema(
     },
     notes: { type: String, default: "" },
     lastPolledAt: { type: Date, default: null },
+    // Outcome of the most recent poll attempt — drives the "Search failed"
+    // monitoring state. null means never polled yet.
+    lastPollStatus: { type: String, enum: ["ok", "error", null], default: null },
+    lastPollError: { type: String, default: null },
   },
   { timestamps: true },
 );

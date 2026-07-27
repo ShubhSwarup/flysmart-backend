@@ -37,7 +37,7 @@ function dedupeKey(tripId: string, type: string): string {
 
 async function sendAndMark(doc: HydratedDocument<NotificationDoc>): Promise<void> {
   try {
-    await sendTelegramMessage(doc.message);
+    await sendTelegramMessage(doc.message, { parseMode: "HTML" });
     doc.sentAt = new Date();
     await doc.save();
     console.log(`Notification sent: ${doc.message}`);
@@ -95,74 +95,150 @@ export async function flushQueuedNotifications(): Promise<void> {
 interface TripLike {
   _id: unknown;
   name: string;
+  origin: string;
   budget: { amount: number; currency: string };
   travelWindow?: { earliestDeparture?: Date | null } | null;
+}
+
+interface CheapestObservationLike {
+  id: string;
+  priceINR: number;
+  airlines: string[];
+  stops: number;
+  departureDate: Date;
+  returnDate: Date | null;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Mirrors the frontend's googleFlightsUrl() helper (trips.$tripId.index.tsx)
+// but scoped to the exact itinerary that triggered the alert, not just the
+// trip's general route — so tapping the link reproduces the fare that was
+// actually found, not a generic search.
+function googleFlightsUrl(params: {
+  origin: string;
+  destinationAirport: string;
+  departureDate: Date;
+  returnDate: Date | null;
+}): string {
+  const dep = params.departureDate.toISOString().slice(0, 10);
+  const query = params.returnDate
+    ? `Flights to ${params.destinationAirport} from ${params.origin} on ${dep} returning ${params.returnDate.toISOString().slice(0, 10)}`
+    : `Flights to ${params.destinationAirport} from ${params.origin} on ${dep}`;
+  return `https://www.google.com/travel/flights?q=${encodeURIComponent(query)}`;
+}
+
+function describeFlight(obs: CheapestObservationLike): string {
+  const airline = obs.airlines[0] ?? "Unknown airline";
+  const stopsLabel = obs.stops === 0 ? "nonstop" : `${obs.stops} stop${obs.stops === 1 ? "" : "s"}`;
+  const date = obs.departureDate.toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+  return `${escapeHtml(airline)}, ${stopsLabel}, departing ${date}`;
+}
+
+// Appended to every alert that's tied to one specific fare (not window_closing,
+// which is a deadline nudge rather than a "here's the fare" alert).
+function flightDetailsBlock(trip: TripLike, destinationAirport: string, cheapest: CheapestObservationLike): string {
+  const link = googleFlightsUrl({
+    origin: trip.origin,
+    destinationAirport,
+    departureDate: cheapest.departureDate,
+    returnDate: cheapest.returnDate,
+  });
+  return `\n${describeFlight(cheapest)}\n<a href="${link}">View on Google Flights</a>`;
 }
 
 export async function evaluateTripNotifications(params: {
   trip: TripLike;
   routeKey: string;
+  destinationAirport: string;
+  cheapest: CheapestObservationLike;
   priorTripLow: number | null;
   priorRouteLow: number | null;
   priorLastPriceINR: number | null;
-  newCheapestINR: number;
-  newCheapestObservationId: string;
   everUnderBudget: boolean;
 }): Promise<void> {
   const tripId = String(params.trip._id);
+  const tripName = escapeHtml(params.trip.name);
   const budget = params.trip.budget.amount;
   const fmt = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+  const newCheapestINR = params.cheapest.priceINR;
+  const details = flightDetailsBlock(params.trip, params.destinationAirport, params.cheapest);
+
+  // baseline_established: fires exactly once, on a trip's genuine first-ever
+  // check (no prior trip low to compare against) — unconditionally, unlike
+  // every other trigger here, since it's a "monitoring is working, here's
+  // what we found" confirmation rather than a "something notable happened"
+  // alert. Runs alongside whatever else fires below (e.g. budget_reached can
+  // still fire too on the same first check) since they're different signals.
+  if (params.priorTripLow == null) {
+    const underBudget = newCheapestINR <= budget;
+    await queueOrSend({
+      tripId,
+      type: "baseline_established",
+      message:
+        `Started monitoring ${tripName} — cheapest fare found so far is ${fmt(newCheapestINR)} round trip` +
+        (underBudget ? ` (already at or under your ${fmt(budget)} budget).` : `.`) +
+        details,
+      relatedObservationId: params.cheapest.id,
+    });
+  }
 
   // new_low: only meaningful once there's a previous low to beat.
-  if (params.priorTripLow != null && params.newCheapestINR < params.priorTripLow) {
+  if (params.priorTripLow != null && newCheapestINR < params.priorTripLow) {
     await queueOrSend({
       tripId,
       type: "new_low",
-      message: `New low for ${params.trip.name}: ${fmt(params.newCheapestINR)} (previous low ${fmt(params.priorTripLow)}).`,
-      relatedObservationId: params.newCheapestObservationId,
+      message: `New low for ${tripName}: ${fmt(newCheapestINR)} round trip (previous low ${fmt(params.priorTripLow)}).${details}`,
+      relatedObservationId: params.cheapest.id,
     });
   }
 
   // budget_reached: fire on the crossing transition (or the very first
   // observation already being under budget), not every subsequent check.
   if (
-    params.newCheapestINR <= budget &&
+    newCheapestINR <= budget &&
     (params.priorLastPriceINR == null || params.priorLastPriceINR > budget)
   ) {
     await queueOrSend({
       tripId,
       type: "budget_reached",
-      message: `${params.trip.name} is now ${fmt(params.newCheapestINR)} — at or under your ${fmt(budget)} budget.`,
-      relatedObservationId: params.newCheapestObservationId,
+      message: `${tripName} is now ${fmt(newCheapestINR)} round trip — at or under your ${fmt(budget)} budget.${details}`,
+      relatedObservationId: params.cheapest.id,
     });
   }
 
   // route_historic_low: rarer than a trip-scoped low — beats every trip/year
   // ever tracked for this route.
-  if (params.priorRouteLow != null && params.newCheapestINR < params.priorRouteLow) {
+  if (params.priorRouteLow != null && newCheapestINR < params.priorRouteLow) {
     await queueOrSend({
       tripId,
       type: "route_historic_low",
-      message: `Historically rare: this is the lowest fare FlySmart has ever recorded for ${params.routeKey} (${fmt(params.newCheapestINR)}).`,
-      relatedObservationId: params.newCheapestObservationId,
+      message: `Historically rare: this is the lowest fare FlySmart has ever recorded for ${escapeHtml(params.routeKey)} (${fmt(newCheapestINR)} round trip).${details}`,
+      relatedObservationId: params.cheapest.id,
     });
   }
 
   // price_spike: >=15% up since the last observation.
   if (params.priorLastPriceINR != null) {
-    const change = (params.newCheapestINR - params.priorLastPriceINR) / params.priorLastPriceINR;
+    const change = (newCheapestINR - params.priorLastPriceINR) / params.priorLastPriceINR;
     if (change >= 0.15) {
       await queueOrSend({
         tripId,
         type: "price_spike",
-        message: `Price jumped ${(change * 100).toFixed(0)}% for ${params.trip.name} — now ${fmt(params.newCheapestINR)}, up from ${fmt(params.priorLastPriceINR)}.`,
-        relatedObservationId: params.newCheapestObservationId,
+        message: `Price jumped ${(change * 100).toFixed(0)}% for ${tripName} — now ${fmt(newCheapestINR)} round trip, up from ${fmt(params.priorLastPriceINR)}.${details}`,
+        relatedObservationId: params.cheapest.id,
       });
     }
   }
 
   // window_closing: travel window opens within 21 days and price has never
-  // crossed budget.
+  // crossed budget. Not tied to one specific fare, so no flight-details block.
   const earliestDeparture = params.trip.travelWindow?.earliestDeparture;
   if (earliestDeparture && !params.everUnderBudget) {
     const daysOut = Math.round((earliestDeparture.getTime() - Date.now()) / 86_400_000);
@@ -170,7 +246,7 @@ export async function evaluateTripNotifications(params: {
       await queueOrSend({
         tripId,
         type: "window_closing",
-        message: `${params.trip.name}'s travel window opens in ${daysOut} day${daysOut === 1 ? "" : "s"} and price still hasn't hit your ${fmt(budget)} budget — decide soon if you're still going.`,
+        message: `${tripName}'s travel window opens in ${daysOut} day${daysOut === 1 ? "" : "s"} and price still hasn't hit your ${fmt(budget)} budget — decide soon if you're still going.`,
       });
     }
   }
@@ -183,7 +259,7 @@ export async function notifyRunFailure(errorSummary: string): Promise<void> {
   const existing = await Notification.findOne({ dedupeKey: key });
   if (existing?.sentAt) return;
 
-  const message = `FlySmart poll run failed: ${errorSummary}`;
+  const message = `FlySmart poll run failed: ${escapeHtml(errorSummary)}`;
   const doc =
     existing ??
     (await Notification.create({

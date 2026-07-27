@@ -27,3 +27,16 @@ export async function getSettings() {
     (await Settings.create({ _id: "global" }))
   );
 }
+
+// Called by each integration after a real provider call (Section 10.4).
+// Resets automatically when the month rolls over.
+export async function incrementApiUsage(provider: string): Promise<void> {
+  const month = new Date().toISOString().slice(0, 7);
+  const settings = await getSettings();
+  const current = settings.apiUsage?.get(provider);
+  const count = current && current.month === month ? (current.count ?? 0) + 1 : 1;
+  await Settings.updateOne(
+    { _id: "global" },
+    { $set: { [`apiUsage.${provider}`]: { month, count } } },
+  );
+}
