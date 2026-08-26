@@ -5,6 +5,7 @@ import { searchFlights } from "../integrations/serpapi.js";
 import { recordObservations, makeRouteKey, airportFromRouteKey } from "./observationService.js";
 import { getPriorTripStats, getPriorRouteLow, hasEverBeenUnderBudget } from "./analyticsService.js";
 import { evaluateTripNotifications } from "./notificationService.js";
+import { getEffectiveEarliestDeparture } from "./tripWindow.js";
 
 // The single per-trip poll operation — shared by the scheduled batch job
 // (scripts/poll.ts) and the immediate baseline search on trip creation
@@ -13,19 +14,26 @@ import { evaluateTripNotifications } from "./notificationService.js";
 // via markPolled's error param so callers don't need their own try/catch.
 export async function pollTrip(trip: InstanceType<typeof Trip>): Promise<void> {
   const budget = trip.budget;
-  const earliestDeparture = trip.travelWindow?.earliestDeparture;
-  if (!earliestDeparture || !trip.tripDuration || !budget) {
-    console.warn(
-      `Skipping "${trip.name}" — no earliestDeparture set (flexible-month trips aren't handled yet).`,
-    );
+  const tripType = trip.tripType ?? "round_trip";
+  // Fixed-date trips use their own earliestDeparture. Flexible-month trips
+  // have no single date — getEffectiveEarliestDeparture samples the 15th of
+  // the earliest selected month as a representative search date, so these
+  // trips actually get monitored instead of being skipped entirely.
+  const earliestDeparture = getEffectiveEarliestDeparture(trip);
+  // tripDuration only matters for round trip — it's what a return date is
+  // computed from. A one-way trip has no return leg, so no duration to
+  // require.
+  if (!earliestDeparture || !budget || (tripType === "round_trip" && !trip.tripDuration?.minNights)) {
+    console.warn(`Skipping "${trip.name}" — no resolvable travel window (no dates or months set).`);
     return;
   }
   const departureDate = earliestDeparture.toISOString().slice(0, 10);
-  const returnDate = new Date(
-    earliestDeparture.getTime() + trip.tripDuration.minNights * 86_400_000,
-  )
-    .toISOString()
-    .slice(0, 10);
+  const returnDate =
+    tripType === "round_trip"
+      ? new Date(earliestDeparture.getTime() + trip.tripDuration!.minNights! * 86_400_000)
+          .toISOString()
+          .slice(0, 10)
+      : undefined;
   const pollTime = new Date();
 
   try {
@@ -36,7 +44,7 @@ export async function pollTrip(trip: InstanceType<typeof Trip>): Promise<void> {
     // which airport the overall-cheapest result actually landed at.
     const priorRouteLowByAirport = new Map<string, number | null>();
     for (const destinationAirport of trip.destinationAirports) {
-      const routeKey = makeRouteKey(trip.origin, destinationAirport, trip.cabinClass);
+      const routeKey = makeRouteKey(trip.origin, destinationAirport, trip.cabinClass, tripType);
       priorRouteLowByAirport.set(destinationAirport, await getPriorRouteLow(routeKey, pollTime));
     }
     const priorTrip = await getPriorTripStats(String(trip._id), pollTime);
@@ -55,6 +63,7 @@ export async function pollTrip(trip: InstanceType<typeof Trip>): Promise<void> {
       departureDate,
       returnDate,
       cabinClass: trip.cabinClass,
+      tripType,
       source: "serpapi",
       itineraries: result.itineraries,
     });
@@ -76,6 +85,7 @@ export async function pollTrip(trip: InstanceType<typeof Trip>): Promise<void> {
           _id: trip._id,
           name: trip.name,
           origin: trip.origin,
+          tripType,
           budget,
           travelWindow: { earliestDeparture },
         },

@@ -1,5 +1,6 @@
 import { Observation } from "../models/Observation.js";
 import { Notification } from "../models/Notification.js";
+import { cadenceDays } from "./tripWindow.js";
 
 export type MonitoringStatus =
   | "not_monitored" // trip status isn't "active" — lifecycle status covers this instead
@@ -22,11 +23,14 @@ interface TripLike {
   budget?: { amount: number } | null;
   lastPolledAt?: Date | null;
   lastPollStatus?: string | null;
+  travelWindowType: "fixed" | "flexible-month";
+  travelWindow?: { earliestDeparture?: Date | null; months?: string[] } | null;
+  priority: "high" | "normal" | "low";
 }
 
-// Must match .github/workflows/poll.yml's schedule ("0 3 * * *"). There's no
-// per-trip cadence yet (Section 10.4's priority-based cadence isn't built),
-// so every active trip shares this one daily check time.
+// Must match .github/workflows/poll.yml's schedule ("0 3 * * *") — the cron
+// only fires once a day, so "next check" is always some future occurrence
+// of this hour, never an arbitrary time in between.
 const SCHEDULED_HOUR_UTC = 3;
 
 export function nextScheduledCheck(from: Date = new Date()): Date {
@@ -37,8 +41,18 @@ export function nextScheduledCheck(from: Date = new Date()): Date {
   return next;
 }
 
+// A trip on the 3-day cadence (Section 10.4) isn't actually due at
+// tomorrow's cron run — it becomes due `cadenceDays` after its last poll,
+// and "next check" is the first scheduled cron run on or after that.
+function computeNextScheduledCheck(trip: TripLike, now: Date): Date {
+  if (!trip.lastPolledAt) return nextScheduledCheck(now);
+  const dueAt = new Date(trip.lastPolledAt.getTime() + cadenceDays(trip) * 86_400_000);
+  return nextScheduledCheck(dueAt > now ? dueAt : now);
+}
+
 export async function getMonitoringInfo(trip: TripLike): Promise<MonitoringInfo> {
-  const nextScheduledCheckAt = nextScheduledCheck().toISOString();
+  const now = new Date();
+  const nextScheduledCheckAt = computeNextScheduledCheck(trip, now).toISOString();
   const lastCheckedAt = trip.lastPolledAt ? trip.lastPolledAt.toISOString() : null;
 
   if (trip.status !== "active") {

@@ -1,15 +1,10 @@
 import { Router } from "express";
 import { Settings, getSettings } from "../models/Settings.js";
+import { sendTelegramMessage } from "../integrations/telegram.js";
+import { env } from "../config/env.js";
+import { PROVIDER_QUOTAS } from "../config/quotas.js";
 
 export const settingsRouter = Router();
-
-// Static per-provider quota knowledge (Section 10) — actual usage counts
-// come from Settings.apiUsage, which integrations update on every real call.
-const PROVIDER_QUOTAS: Record<string, { quota: number; unit: string }> = {
-  serpapi: { quota: 250, unit: "searches" },
-  duffel: { quota: 200, unit: "searches" },
-  travelpayouts: { quota: 1000, unit: "requests" },
-};
 
 settingsRouter.get("/", async (_req, res) => {
   const settings = await getSettings();
@@ -36,6 +31,25 @@ settingsRouter.patch("/", async (req, res) => {
     res.json(settings);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Sends a real Telegram message through the actual configured bot/chat ID —
+// previously this was faked entirely on the frontend (a setTimeout that
+// always "succeeded"), which meant a broken chat ID looked identical to a
+// working one until a real notification silently failed to arrive.
+settingsRouter.post("/test-message", async (_req, res) => {
+  const settings = await getSettings();
+  if (!settings.telegramChatId && !env.telegramChatId) {
+    return res.status(400).json({ error: "No Telegram chat ID configured." });
+  }
+  try {
+    await sendTelegramMessage(
+      "✅ This is a test message from FlySmart — your Telegram notifications are working.",
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 

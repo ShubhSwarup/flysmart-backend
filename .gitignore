@@ -2,3 +2,8 @@ node_modules
 dist
 .env
 *.log
+
+# Local backup-script output — this repo is public; real trip/price data
+# must never be committed here. The actual backup destination is a
+# dedicated private repo, wired up via .github/workflows/backup.yml.
+backups/

@@ -1,6 +1,6 @@
 import { connectDB, disconnectDB } from "../config/db.js";
 import { Trip } from "../models/Trip.js";
-import { getActiveTrips } from "../services/tripService.js";
+import { getDueTrips } from "../services/tripService.js";
 import { pollTrip } from "../services/pollService.js";
 import { notifyRunFailure, flushQueuedNotifications } from "../services/notificationService.js";
 
@@ -45,8 +45,8 @@ async function run(): Promise<void> {
     await ensureSeedTrip();
     await flushQueuedNotifications();
 
-    const trips = await getActiveTrips();
-    console.log(`Polling ${trips.length} active trip(s)...`);
+    const trips = await getDueTrips();
+    console.log(`Polling ${trips.length} due trip(s)...`);
 
     for (const trip of trips) {
       await pollTrip(trip);

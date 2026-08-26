@@ -96,8 +96,13 @@ interface TripLike {
   _id: unknown;
   name: string;
   origin: string;
+  tripType: "round_trip" | "one_way";
   budget: { amount: number; currency: string };
   travelWindow?: { earliestDeparture?: Date | null } | null;
+}
+
+function tripTypeLabel(tripType: TripLike["tripType"]): string {
+  return tripType === "one_way" ? "one-way" : "round trip";
 }
 
 interface CheapestObservationLike {
@@ -168,6 +173,7 @@ export async function evaluateTripNotifications(params: {
   const budget = params.trip.budget.amount;
   const fmt = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
   const newCheapestINR = params.cheapest.priceINR;
+  const typeLabel = tripTypeLabel(params.trip.tripType);
   const details = flightDetailsBlock(params.trip, params.destinationAirport, params.cheapest);
 
   // baseline_established: fires exactly once, on a trip's genuine first-ever
@@ -182,7 +188,7 @@ export async function evaluateTripNotifications(params: {
       tripId,
       type: "baseline_established",
       message:
-        `Started monitoring ${tripName} — cheapest fare found so far is ${fmt(newCheapestINR)} round trip` +
+        `Started monitoring ${tripName} — cheapest fare found so far is ${fmt(newCheapestINR)} ${typeLabel}` +
         (underBudget ? ` (already at or under your ${fmt(budget)} budget).` : `.`) +
         details,
       relatedObservationId: params.cheapest.id,
@@ -194,7 +200,7 @@ export async function evaluateTripNotifications(params: {
     await queueOrSend({
       tripId,
       type: "new_low",
-      message: `New low for ${tripName}: ${fmt(newCheapestINR)} round trip (previous low ${fmt(params.priorTripLow)}).${details}`,
+      message: `New low for ${tripName}: ${fmt(newCheapestINR)} ${typeLabel} (previous low ${fmt(params.priorTripLow)}).${details}`,
       relatedObservationId: params.cheapest.id,
     });
   }
@@ -208,7 +214,7 @@ export async function evaluateTripNotifications(params: {
     await queueOrSend({
       tripId,
       type: "budget_reached",
-      message: `${tripName} is now ${fmt(newCheapestINR)} round trip — at or under your ${fmt(budget)} budget.${details}`,
+      message: `${tripName} is now ${fmt(newCheapestINR)} ${typeLabel} — at or under your ${fmt(budget)} budget.${details}`,
       relatedObservationId: params.cheapest.id,
     });
   }
@@ -219,7 +225,7 @@ export async function evaluateTripNotifications(params: {
     await queueOrSend({
       tripId,
       type: "route_historic_low",
-      message: `Historically rare: this is the lowest fare FlySmart has ever recorded for ${escapeHtml(params.routeKey)} (${fmt(newCheapestINR)} round trip).${details}`,
+      message: `Historically rare: this is the lowest fare FlySmart has ever recorded for ${escapeHtml(params.routeKey)} (${fmt(newCheapestINR)} ${typeLabel}).${details}`,
       relatedObservationId: params.cheapest.id,
     });
   }
@@ -231,7 +237,7 @@ export async function evaluateTripNotifications(params: {
       await queueOrSend({
         tripId,
         type: "price_spike",
-        message: `Price jumped ${(change * 100).toFixed(0)}% for ${tripName} — now ${fmt(newCheapestINR)} round trip, up from ${fmt(params.priorLastPriceINR)}.${details}`,
+        message: `Price jumped ${(change * 100).toFixed(0)}% for ${tripName} — now ${fmt(newCheapestINR)} ${typeLabel}, up from ${fmt(params.priorLastPriceINR)}.${details}`,
         relatedObservationId: params.cheapest.id,
       });
     }

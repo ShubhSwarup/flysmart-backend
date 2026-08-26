@@ -13,14 +13,22 @@ const tripSchema = new Schema(
       enum: ["fixed", "flexible-month"],
       required: true,
     },
+    // Orthogonal to travelWindowType — a trip can be fixed-date-and-one-way,
+    // flexible-month-and-round-trip, etc. Defaults to "round_trip" so
+    // pre-existing trips (created before this field existed) read back
+    // correctly via Mongoose's default-on-missing-path behavior, no
+    // migration needed for the trips collection itself.
+    tripType: { type: String, enum: ["round_trip", "one_way"], default: "round_trip" },
     travelWindow: {
       earliestDeparture: { type: Date, default: null },
       latestDeparture: { type: Date, default: null },
       months: { type: [String], default: [] },
     },
+    // Not required — meaningless for a one-way trip (no return leg to
+    // measure a stay length against).
     tripDuration: {
-      minNights: { type: Number, required: true },
-      maxNights: { type: Number, required: true },
+      minNights: { type: Number, default: null },
+      maxNights: { type: Number, default: null },
     },
     budget: {
       amount: { type: Number, required: true },
