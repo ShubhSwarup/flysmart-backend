@@ -6,7 +6,18 @@ interface PriorTripStats {
 }
 
 // Stats as they stood *before* this poll cycle — the baseline a new
-// observation is compared against (Section 11.2's "previous low", "last check").
+// observation is compared against (Section 11.2's "previous low", "last
+// check"). Pooled by tripId alone, across every candidate itinerary this
+// trip has ever priced (searchCandidateService.ts) — for a trip with a real
+// date range this is exactly the intended meaning ("the best we've found
+// across every realistic option for this trip idea"), and for a trip with
+// only ever one exact date (a fixed single-date trip) it's equivalent to
+// scoping by that date anyway, since no other date pair exists under this
+// tripId. (An earlier version of this function scoped by exact date pair
+// specifically to stop a flexible-month trip's single silently-rolling
+// sample date from blending two unrelated itineraries' history together —
+// that rolling-single-date model no longer exists, so the narrower scoping
+// it required is gone too.)
 export async function getPriorTripStats(tripId: string, beforeDate: Date): Promise<PriorTripStats> {
   const prior = await Observation.find({ tripId, queriedAt: { $lt: beforeDate } })
     .sort({ queriedAt: -1 })

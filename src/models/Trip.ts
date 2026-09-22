@@ -7,10 +7,15 @@ const tripSchema = new Schema(
     originAlternates: { type: [String], default: [] },
     destination: { type: String, required: true },
     destinationAirports: { type: [String], required: true },
+    // Open-jaw round trip: the return leg departs from these airport(s)
+    // instead of wherever the outbound leg landed — e.g. arrive Manila,
+    // depart Cebu. Empty means a normal symmetric round trip (unchanged
+    // behavior); meaningless for a one-way trip.
+    openJawReturnAirports: { type: [String], default: [] },
     regionTag: { type: String, required: true, index: true },
     travelWindowType: {
       type: String,
-      enum: ["fixed", "flexible-month"],
+      enum: ["fixed", "flexible-month", "days-off"],
       required: true,
     },
     // Orthogonal to travelWindowType — a trip can be fixed-date-and-one-way,
@@ -23,7 +28,23 @@ const tripSchema = new Schema(
       earliestDeparture: { type: Date, default: null },
       latestDeparture: { type: Date, default: null },
       months: { type: [String], default: [] },
+      // Provenance for a "days-off" trip — resolves through
+      // earliestDeparture/latestDeparture above exactly like a fixed trip
+      // (a days-off option is a single, already-decided window, not an
+      // open range to keep searching), this is purely for display and
+      // for a future "recheck options" action, never read by the search
+      // engine itself.
+      daysOffContext: {
+        anchors: { type: [Date], default: undefined },
+        leaveBudget: { type: Number, default: null },
+        leaveDaysUsed: { type: Number, default: null },
+      },
     },
+    // Trips created together from one Days Off preview (more than one
+    // option chosen to track at once) share this id so the dashboard can
+    // show them as one trip idea with a few open date options, rather than
+    // as unrelated trips. Unset for every other trip.
+    daysOffGroupId: { type: String, default: null, index: true },
     // Not required — meaningless for a one-way trip (no return leg to
     // measure a stay length against).
     tripDuration: {
@@ -55,6 +76,17 @@ const tripSchema = new Schema(
     // monitoring state. null means never polled yet.
     lastPollStatus: { type: String, enum: ["ok", "error", null], default: null },
     lastPollError: { type: String, default: null },
+    // Google's own price-insight signal, returned free on every SerpApi
+    // search (Section 10.1/12.4) — captured here so it's available as a
+    // cold-start comparison before this trip has its own dense history,
+    // rather than being fetched and discarded.
+    lastPriceInsight: {
+      lowestPrice: { type: Number, default: null },
+      priceLevel: { type: String, default: null },
+      typicalPriceRangeLow: { type: Number, default: null },
+      typicalPriceRangeHigh: { type: Number, default: null },
+      checkedAt: { type: Date, default: null },
+    },
   },
   { timestamps: true },
 );

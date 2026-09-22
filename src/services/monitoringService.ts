@@ -23,7 +23,7 @@ interface TripLike {
   budget?: { amount: number } | null;
   lastPolledAt?: Date | null;
   lastPollStatus?: string | null;
-  travelWindowType: "fixed" | "flexible-month";
+  travelWindowType: "fixed" | "flexible-month" | "days-off";
   travelWindow?: { earliestDeparture?: Date | null; months?: string[] } | null;
   priority: "high" | "normal" | "low";
 }

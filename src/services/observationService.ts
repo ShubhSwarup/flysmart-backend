@@ -57,6 +57,10 @@ export async function recordObservations(input: RecordObservationsInput) {
       airlines: it.airlines,
       stops: it.stops,
       layoverMinutes: it.layoverMinutes,
+      // Set only for an open-jaw itinerary (the return leg departed from a
+      // different airport than the outbound leg arrived at) — null for a
+      // normal symmetric round trip or a one-way fare.
+      returnDepartureAirport: it.returnDepartureAirport,
       cabinClass: input.cabinClass,
       refundable: null,
       baggageIncluded: null,

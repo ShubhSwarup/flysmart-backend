@@ -21,6 +21,11 @@ const observationSchema = new Schema({
   airlines: { type: [String], default: [] },
   stops: { type: Number, required: true },
   layoverMinutes: { type: [Number], default: [] },
+  // Set only for an open-jaw itinerary — the return leg's actual departure
+  // airport, when it differs from where the outbound leg landed (arrival
+  // Manila, return departing Cebu). Null for a normal round trip or a
+  // one-way fare.
+  returnDepartureAirport: { type: String, default: null },
   cabinClass: { type: String, required: true },
   refundable: { type: Boolean, default: null },
   baggageIncluded: { type: Boolean, default: null },

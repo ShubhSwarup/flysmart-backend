@@ -6,3 +6,11 @@ export const PROVIDER_QUOTAS: Record<string, { quota: number; unit: string }> = 
   duffel: { quota: 200, unit: "searches" },
   travelpayouts: { quota: 1000, unit: "requests" },
 };
+
+// The most real searches a single trip with a genuine date range (a
+// flexible-month or fixed-date-range trip) spends verifying candidates in
+// one poll cycle — deliberately small and shared across every such trip, so
+// no one trip's window size can dominate the shared monthly SerpApi budget.
+// A trip with exactly one candidate (a single exact date) only ever spends
+// 1 regardless of this constant.
+export const MAX_CANDIDATES_PER_CYCLE = 3;

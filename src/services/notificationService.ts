@@ -112,6 +112,9 @@ interface CheapestObservationLike {
   stops: number;
   departureDate: Date;
   returnDate: Date | null;
+  // Set only for an open-jaw itinerary — the return leg's actual departure
+  // airport, when it differs from the outbound leg's arrival airport.
+  returnDepartureAirport: string | null;
 }
 
 function escapeHtml(s: string): string {
@@ -121,17 +124,27 @@ function escapeHtml(s: string): string {
 // Mirrors the frontend's googleFlightsUrl() helper (trips.$tripId.index.tsx)
 // but scoped to the exact itinerary that triggered the alert, not just the
 // trip's general route — so tapping the link reproduces the fare that was
-// actually found, not a generic search.
+// actually found, not a generic search. An open-jaw itinerary needs its
+// query phrased as two explicit legs — a plain "returning" query would
+// silently imply flying back from the same city it flew into, which isn't
+// the fare that was actually found.
 function googleFlightsUrl(params: {
   origin: string;
   destinationAirport: string;
   departureDate: Date;
   returnDate: Date | null;
+  returnDepartureAirport: string | null;
 }): string {
   const dep = params.departureDate.toISOString().slice(0, 10);
-  const query = params.returnDate
-    ? `Flights to ${params.destinationAirport} from ${params.origin} on ${dep} returning ${params.returnDate.toISOString().slice(0, 10)}`
-    : `Flights to ${params.destinationAirport} from ${params.origin} on ${dep}`;
+  let query: string;
+  if (params.returnDate && params.returnDepartureAirport) {
+    const ret = params.returnDate.toISOString().slice(0, 10);
+    query = `Flights from ${params.origin} to ${params.destinationAirport} on ${dep}, then ${params.returnDepartureAirport} to ${params.origin} on ${ret}`;
+  } else if (params.returnDate) {
+    query = `Flights to ${params.destinationAirport} from ${params.origin} on ${dep} returning ${params.returnDate.toISOString().slice(0, 10)}`;
+  } else {
+    query = `Flights to ${params.destinationAirport} from ${params.origin} on ${dep}`;
+  }
   return `https://www.google.com/travel/flights?q=${encodeURIComponent(query)}`;
 }
 
@@ -143,7 +156,8 @@ function describeFlight(obs: CheapestObservationLike): string {
     month: "short",
     year: "numeric",
   });
-  return `${escapeHtml(airline)}, ${stopsLabel}, departing ${date}`;
+  const openJawNote = obs.returnDepartureAirport ? `, returning from ${obs.returnDepartureAirport}` : "";
+  return `${escapeHtml(airline)}, ${stopsLabel}, departing ${date}${openJawNote}`;
 }
 
 // Appended to every alert that's tied to one specific fare (not window_closing,
@@ -154,6 +168,7 @@ function flightDetailsBlock(trip: TripLike, destinationAirport: string, cheapest
     destinationAirport,
     departureDate: cheapest.departureDate,
     returnDate: cheapest.returnDate,
+    returnDepartureAirport: cheapest.returnDepartureAirport,
   });
   return `\n${describeFlight(cheapest)}\n<a href="${link}">View on Google Flights</a>`;
 }
