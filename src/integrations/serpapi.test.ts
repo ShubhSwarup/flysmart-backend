@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { splitMultiCityLegs, type FlightLeg } from "./serpapi.js";
+import { buildSearchUrl, isNoResultsError, splitMultiCityLegs, type FlightLeg } from "./serpapi.js";
 
 function leg(departure: string, arrival: string): FlightLeg {
   return {
@@ -50,5 +50,65 @@ describe("splitMultiCityLegs", () => {
     const { outbound, inbound } = splitMultiCityLegs(flights, ["MNL"]);
     expect(outbound).toEqual(flights);
     expect(inbound).toEqual([]);
+  });
+});
+
+describe("buildSearchUrl", () => {
+  const roundTrip = {
+    origin: "BOM",
+    destinationAirports: ["NRT", "HND"],
+    departureDate: "2027-03-03",
+    returnDate: "2027-03-17",
+    cabinClass: "economy",
+  };
+
+  test("sends the trip's stop limit as Google's filter value, which is offset by one", () => {
+    const stopValue = (maxStops: number) =>
+      buildSearchUrl({ ...roundTrip, maxStops }).searchParams.get("stops");
+    expect(stopValue(0)).toBe("1"); // nonstop
+    expect(stopValue(1)).toBe("2"); // one stop or fewer
+    expect(stopValue(2)).toBe("3"); // two stops or fewer
+  });
+
+  test("leaves the search unfiltered when the trip accepts anything", () => {
+    const url = buildSearchUrl({ ...roundTrip, maxStops: null, maxLayoverMinutes: null });
+    expect(url.searchParams.has("stops")).toBe(false);
+    expect(url.searchParams.has("layover_duration")).toBe(false);
+  });
+
+  test("sends the layover limit as a min,max range", () => {
+    const url = buildSearchUrl({ ...roundTrip, maxLayoverMinutes: 360 });
+    expect(url.searchParams.get("layover_duration")).toBe("30,360");
+  });
+
+  test("keeps an unusually short layover limit a valid range", () => {
+    const url = buildSearchUrl({ ...roundTrip, maxLayoverMinutes: 20 });
+    expect(url.searchParams.get("layover_duration")).toBe("20,20");
+  });
+
+  test("uses multi-city mode for an open-jaw trip, filters included", () => {
+    const url = buildSearchUrl({
+      ...roundTrip,
+      destinationAirports: ["HAN"],
+      returnDepartureAirports: ["PQC"],
+      maxStops: 1,
+    });
+    expect(url.searchParams.get("type")).toBe("3");
+    expect(url.searchParams.get("stops")).toBe("2");
+    expect(JSON.parse(url.searchParams.get("multi_city_json")!)).toEqual([
+      { departure_id: "BOM", arrival_id: "HAN", date: "2027-03-03" },
+      { departure_id: "PQC", arrival_id: "BOM", date: "2027-03-17" },
+    ]);
+  });
+});
+
+describe("isNoResultsError", () => {
+  test("recognises Google having no flights as an answer, not a failure", () => {
+    expect(isNoResultsError("Google Flights hasn't returned any results for this query.")).toBe(true);
+  });
+
+  test("leaves real failures alone", () => {
+    expect(isNoResultsError("Invalid API key.")).toBe(false);
+    expect(isNoResultsError("Your account has run out of searches.")).toBe(false);
   });
 });

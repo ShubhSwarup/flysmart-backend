@@ -1,13 +1,21 @@
 import type { Types } from "mongoose";
 import { SearchCandidate } from "../models/SearchCandidate.js";
 import { Observation } from "../models/Observation.js";
-import { enumerateCandidateSpecs, estimateCandidate } from "./candidateRanking.js";
+import { makeRouteKey } from "./observationService.js";
+import {
+  chooseCandidatesToVerify,
+  enumerateCandidateSpecs,
+  estimateCandidate,
+  weekIndex,
+} from "./candidateRanking.js";
+import { CONFIRMED_FARE_MAX_AGE_DAYS } from "../config/quotas.js";
 import type { CandidateWindow } from "./tripWindow.js";
 
 interface TripLike {
   _id: Types.ObjectId;
   origin: string;
   destinationAirports: string[];
+  openJawReturnAirports?: string[];
   cabinClass: string;
   tripType: "round_trip" | "one_way";
   tripDuration?: { minNights?: number | null; maxNights?: number | null } | null;
@@ -20,8 +28,8 @@ interface TripLike {
 // it did. A brand-new route with no observations yet returns null rather
 // than a fabricated number.
 async function routeHistoryAverage(trip: TripLike): Promise<number | null> {
-  const routeKeys = trip.destinationAirports.map(
-    (airport) => `${trip.origin}-${airport}-${trip.cabinClass}-${trip.tripType}`,
+  const routeKeys = trip.destinationAirports.map((airport) =>
+    makeRouteKey(trip.origin, airport, trip.cabinClass, trip.tripType, trip.openJawReturnAirports),
   );
   const result = await Observation.aggregate([
     { $match: { routeKey: { $in: routeKeys } } },
@@ -78,62 +86,131 @@ export async function ensureCandidates(trip: TripLike, window: CandidateWindow):
   }
 }
 
-// Which of a trip's candidates get a real search spent on them this cycle,
-// bounded by `limit` (Section G's per-cycle budget). Never-verified
-// candidates always come first, cheapest-looking (by the free Tier-1
-// ranking) first among them — once every candidate has been checked at
-// least once, verified candidates get re-checked oldest-first, which
-// naturally rotates through the whole window over time (including,
-// eventually, the current best-known one) without needing a special case
-// for "keep the best one extra fresh."
-export async function pickCandidatesToVerify(tripId: Types.ObjectId, limit: number) {
-  const unverified = await SearchCandidate.find({ tripId, status: "estimated" })
-    .sort({ rankScore: 1 })
-    .limit(limit);
-  if (unverified.length >= limit) return unverified;
+function inWindowFilter(tripId: Types.ObjectId, window: CandidateWindow) {
+  return { tripId, departureDate: { $gte: window.earliest, $lte: window.latest } };
+}
 
-  const remaining = limit - unverified.length;
-  const dueForRefresh = await SearchCandidate.find({ tripId, status: "verified" })
-    .sort({ lastCheckedAt: 1 })
-    .limit(remaining);
-  return [...unverified, ...dueForRefresh];
+// Which of a trip's candidates get a real search spent on them this cycle,
+// bounded by `limit` (Section G's per-cycle budget) — see
+// chooseCandidatesToVerify for how. Only dates still inside the live window
+// are considered, so a date that's slipped into the past is never searched.
+export async function pickCandidatesToVerify(
+  tripId: Types.ObjectId,
+  window: CandidateWindow,
+  limit: number,
+  bestCandidateId: Types.ObjectId | null,
+) {
+  const candidates = await SearchCandidate.find(inWindowFilter(tripId, window));
+  const priced = await loadObservations(candidates);
+  const priceOf = (candidate: InstanceType<typeof SearchCandidate>) => {
+    const id = candidate.confirmedObservationId ?? candidate.observationId;
+    return id ? (priced.get(String(id))?.priceINR ?? null) : null;
+  };
+
+  const chosen = chooseCandidatesToVerify(
+    candidates.map((c) => ({
+      id: String(c._id),
+      departureDate: c.departureDate,
+      returnDate: c.returnDate ?? null,
+      verified: c.status === "verified",
+      rankScore: c.rankScore,
+      lastCheckedAt: c.lastCheckedAt ?? null,
+      priceINR: priceOf(c),
+    })),
+    window.earliest,
+    limit,
+    bestCandidateId ? String(bestCandidateId) : null,
+  );
+  const byId = new Map(candidates.map((c) => [String(c._id), c]));
+  return chosen.map((c) => byId.get(c.id)!);
+}
+
+async function loadObservations(candidates: InstanceType<typeof SearchCandidate>[]) {
+  const ids = candidates.flatMap((c) =>
+    [c.observationId, c.confirmedObservationId].filter((id) => id != null),
+  );
+  const observations = await Observation.find({ _id: { $in: ids } });
+  return new Map(observations.map((o) => [String(o._id), o]));
 }
 
 export interface BestVerifiedCandidate {
   candidate: InstanceType<typeof SearchCandidate>;
   observation: InstanceType<typeof Observation>;
+  confirmed: boolean;
 }
 
-// The cheapest verified candidate currently within the trip's live window —
-// "the best realistic trip found so far," which is what a multi-candidate
-// trip's notifications and displayed price should mean, not "whatever this
-// one cycle happened to check." Candidates outside the current window
-// (e.g. left over from a flexible-month trip's since-elapsed month) are
-// excluded, so a stale document can never resurface as "the best trip."
+// The cheapest date pair in the trip's live window with a confirmed, recent
+// whole-trip fare — "the best realistic trip found so far," which is what a
+// multi-candidate trip's notifications and displayed price should mean.
+// Candidates outside the current window are excluded, so a stale document can
+// never resurface as "the best trip."
+//
+// Only when nothing is confirmed does this fall back to the cheapest lead,
+// flagged as such (confirmed: false), so the dashboard has something honest to
+// show instead of nothing. Notifications ignore those.
 export async function getBestVerifiedCandidate(
   tripId: Types.ObjectId,
   window: CandidateWindow,
 ): Promise<BestVerifiedCandidate | null> {
   const candidates = await SearchCandidate.find({
-    tripId,
+    ...inWindowFilter(tripId, window),
     status: "verified",
-    observationId: { $ne: null },
-    departureDate: { $gte: window.earliest, $lte: window.latest },
+    $or: [{ observationId: { $ne: null } }, { confirmedObservationId: { $ne: null } }],
   });
   if (candidates.length === 0) return null;
+  const byId = await loadObservations(candidates);
 
-  const observations = await Observation.find({
-    _id: { $in: candidates.map((c) => c.observationId) },
-  });
-  const byId = new Map(observations.map((o) => [String(o._id), o]));
-
-  let best: BestVerifiedCandidate | null = null;
+  const oldestConfirmation = Date.now() - CONFIRMED_FARE_MAX_AGE_DAYS * 86_400_000;
+  let bestConfirmed: BestVerifiedCandidate | null = null;
+  let bestLead: BestVerifiedCandidate | null = null;
   for (const candidate of candidates) {
-    const observation = byId.get(String(candidate.observationId));
-    if (!observation) continue;
-    if (!best || observation.priceINR < best.observation.priceINR) {
-      best = { candidate, observation };
+    const confirmed = candidate.confirmedObservationId
+      ? byId.get(String(candidate.confirmedObservationId))
+      : undefined;
+    if (
+      confirmed &&
+      candidate.confirmedAt &&
+      candidate.confirmedAt.getTime() >= oldestConfirmation &&
+      (!bestConfirmed || confirmed.priceINR < bestConfirmed.observation.priceINR)
+    ) {
+      bestConfirmed = { candidate, observation: confirmed, confirmed: true };
+    }
+    const lead = candidate.observationId ? byId.get(String(candidate.observationId)) : undefined;
+    if (
+      lead &&
+      !candidate.noBookableReturn &&
+      (!bestLead || lead.priceINR < bestLead.observation.priceINR)
+    ) {
+      bestLead = { candidate, observation: lead, confirmed: false };
     }
   }
-  return best;
+  return bestConfirmed ?? bestLead;
+}
+
+export interface SearchCoverage {
+  datesChecked: number;
+  datesTotal: number;
+  weeksChecked: number;
+  weeksTotal: number;
+}
+
+// How much of the window has really been looked at. "Cheapest fare" means very
+// little without it: 3 of 183 options is a first impression, not an answer.
+export async function getCoverage(
+  tripId: Types.ObjectId,
+  window: CandidateWindow,
+): Promise<SearchCoverage> {
+  const candidates = await SearchCandidate.find(inWindowFilter(tripId, window), {
+    departureDate: 1,
+    status: 1,
+  }).lean();
+  const weeks = new Set(candidates.map((c) => weekIndex(c.departureDate, window.earliest)));
+  const checked = candidates.filter((c) => c.status === "verified");
+  const checkedWeeks = new Set(checked.map((c) => weekIndex(c.departureDate, window.earliest)));
+  return {
+    datesChecked: checked.length,
+    datesTotal: candidates.length,
+    weeksChecked: checkedWeeks.size,
+    weeksTotal: weeks.size,
+  };
 }

@@ -50,7 +50,10 @@ function computeNextScheduledCheck(trip: TripLike, now: Date): Date {
   return nextScheduledCheck(dueAt > now ? dueAt : now);
 }
 
-export async function getMonitoringInfo(trip: TripLike): Promise<MonitoringInfo> {
+export async function getMonitoringInfo(
+  trip: TripLike,
+  bestFarePriceINR: number | null,
+): Promise<MonitoringInfo> {
   const now = new Date();
   const nextScheduledCheckAt = computeNextScheduledCheck(trip, now).toISOString();
   const lastCheckedAt = trip.lastPolledAt ? trip.lastPolledAt.toISOString() : null;
@@ -92,7 +95,7 @@ export async function getMonitoringInfo(trip: TripLike): Promise<MonitoringInfo>
     };
   }
 
-  if (trip.budget && latestObservation.priceINR <= trip.budget.amount) {
+  if (trip.budget && bestFarePriceINR != null && bestFarePriceINR <= trip.budget.amount) {
     return { monitoringStatus: "budget_reached", lastCheckedAt, nextScheduledCheckAt, lastNotification: null };
   }
 

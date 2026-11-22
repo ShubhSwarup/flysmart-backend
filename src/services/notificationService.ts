@@ -2,6 +2,8 @@ import type { HydratedDocument } from "mongoose";
 import { Notification, type NotificationDoc } from "../models/Notification.js";
 import { getSettings } from "../models/Settings.js";
 import { sendTelegramMessage } from "../integrations/telegram.js";
+import { LONG_LAYOVER_MINUTES } from "./tripConstraints.js";
+import type { SearchCoverage } from "./searchCandidateService.js";
 
 interface QuietHours {
   start: string; // "HH:mm"
@@ -110,24 +112,25 @@ interface CheapestObservationLike {
   priceINR: number;
   airlines: string[];
   stops: number;
+  layoverMinutes: number[];
   departureDate: Date;
   returnDate: Date | null;
   // Set only for an open-jaw itinerary — the return leg's actual departure
   // airport, when it differs from the outbound leg's arrival airport.
   returnDepartureAirport: string | null;
+  returnLeg: { airlines: string[]; stops: number; layoverMinutes: number[] } | null;
+  googleFlightsUrl: string | null;
 }
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Mirrors the frontend's googleFlightsUrl() helper (trips.$tripId.index.tsx)
-// but scoped to the exact itinerary that triggered the alert, not just the
-// trip's general route — so tapping the link reproduces the fare that was
-// actually found, not a generic search. An open-jaw itinerary needs its
-// query phrased as two explicit legs — a plain "returning" query would
-// silently imply flying back from the same city it flew into, which isn't
-// the fare that was actually found.
+// A fallback for a fare with no link from Google itself. Scoped to the exact
+// itinerary that triggered the alert, not just the trip's general route. An
+// open-jaw itinerary needs its query phrased as two explicit legs — a plain
+// "returning" query would silently imply flying back from the same city it
+// flew into, which isn't the fare that was actually found.
 function googleFlightsUrl(params: {
   origin: string;
   destinationAirport: string;
@@ -148,29 +151,72 @@ function googleFlightsUrl(params: {
   return `https://www.google.com/travel/flights?q=${encodeURIComponent(query)}`;
 }
 
+function stopsLabel(stops: number): string {
+  return stops === 0 ? "nonstop" : `${stops} stop${stops === 1 ? "" : "s"}`;
+}
+
+function shortDate(date: Date): string {
+  return date.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+}
+
 function describeFlight(obs: CheapestObservationLike): string {
   const airline = obs.airlines[0] ?? "Unknown airline";
-  const stopsLabel = obs.stops === 0 ? "nonstop" : `${obs.stops} stop${obs.stops === 1 ? "" : "s"}`;
-  const date = obs.departureDate.toLocaleDateString("en-GB", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  });
-  const openJawNote = obs.returnDepartureAirport ? `, returning from ${obs.returnDepartureAirport}` : "";
-  return `${escapeHtml(airline)}, ${stopsLabel}, departing ${date}${openJawNote}`;
+  const lines = [`${escapeHtml(airline)}, ${stopsLabel(obs.stops)}, departing ${shortDate(obs.departureDate)}`];
+  if (obs.returnLeg && obs.returnDate) {
+    const from = obs.returnDepartureAirport ? ` from ${obs.returnDepartureAirport}` : "";
+    const returnAirline = obs.returnLeg.airlines[0] ?? "Unknown airline";
+    lines.push(
+      `Back ${shortDate(obs.returnDate)}${from}: ${escapeHtml(returnAirline)}, ${stopsLabel(obs.returnLeg.stops)}`,
+    );
+  }
+  const layovers = [...obs.layoverMinutes, ...(obs.returnLeg?.layoverMinutes ?? [])];
+  const longest = Math.max(0, ...layovers);
+  if (longest >= LONG_LAYOVER_MINUTES) lines.push(`Includes a ${Math.round(longest / 60)}h layover.`);
+  return lines.join("\n");
 }
 
 // Appended to every alert that's tied to one specific fare (not window_closing,
 // which is a deadline nudge rather than a "here's the fare" alert).
 function flightDetailsBlock(trip: TripLike, destinationAirport: string, cheapest: CheapestObservationLike): string {
-  const link = googleFlightsUrl({
-    origin: trip.origin,
-    destinationAirport,
-    departureDate: cheapest.departureDate,
-    returnDate: cheapest.returnDate,
-    returnDepartureAirport: cheapest.returnDepartureAirport,
-  });
-  return `\n${describeFlight(cheapest)}\n<a href="${link}">View on Google Flights</a>`;
+  const link =
+    cheapest.googleFlightsUrl ??
+    googleFlightsUrl({
+      origin: trip.origin,
+      destinationAirport,
+      departureDate: cheapest.departureDate,
+      returnDate: cheapest.returnDate,
+      returnDepartureAirport: cheapest.returnDepartureAirport,
+    });
+  return `\n${describeFlight(cheapest)}\n<a href="${escapeHtml(link)}">View on Google Flights</a>`;
+}
+
+// "Cheapest so far" is only as strong as what's been looked at, so a first
+// report says how much of the window that is.
+function coverageNote(coverage: SearchCoverage): string {
+  if (coverage.weeksChecked >= coverage.weeksTotal) return "";
+  return ` ${coverage.weeksChecked} of ${coverage.weeksTotal} weeks checked so far.`;
+}
+
+type FareAlertType = "budget_reached" | "route_historic_low" | "new_low";
+
+// The single alert, if any, for a new best fare. A fare crossing into budget
+// comes first since that's the one the user acted on by setting a budget.
+export function chooseFareAlert(input: {
+  newBest: number;
+  budget: number;
+  priorBest: number | null;
+  priorLow: number | null;
+  priorRouteLow: number | null;
+}): { type: FareAlertType; alsoRouteRecord: boolean } | null {
+  const { newBest, budget, priorBest, priorLow, priorRouteLow } = input;
+  const isRouteRecord = priorRouteLow != null && newBest < priorRouteLow;
+  // A first fare doesn't cross anything — the baseline message covers it.
+  const crossedBudget = priorBest != null && newBest <= budget && priorBest > budget;
+
+  if (crossedBudget) return { type: "budget_reached", alsoRouteRecord: isRouteRecord };
+  if (isRouteRecord) return { type: "route_historic_low", alsoRouteRecord: false };
+  if (priorLow != null && newBest < priorLow) return { type: "new_low", alsoRouteRecord: false };
+  return null;
 }
 
 export async function evaluateTripNotifications(params: {
@@ -178,10 +224,16 @@ export async function evaluateTripNotifications(params: {
   routeKey: string;
   destinationAirport: string;
   cheapest: CheapestObservationLike;
-  priorTripLow: number | null;
+  // The trip's previous best fare, and the lowest it has ever been. Null on a
+  // trip's first confirmed fare.
+  priorBest: number | null;
+  priorLow: number | null;
   priorRouteLow: number | null;
-  priorLastPriceINR: number | null;
   everUnderBudget: boolean;
+  coverage: SearchCoverage;
+  // Set on a first confirmed fare when the trip already has recorded prices
+  // (an existing trip, or a search that was just edited) — the lowest of them.
+  previouslyRecordedLow: number | null;
 }): Promise<void> {
   const tripId = String(params.trip._id);
   const tripName = escapeHtml(params.trip.name);
@@ -190,69 +242,73 @@ export async function evaluateTripNotifications(params: {
   const newCheapestINR = params.cheapest.priceINR;
   const typeLabel = tripTypeLabel(params.trip.tripType);
   const details = flightDetailsBlock(params.trip, params.destinationAirport, params.cheapest);
+  const underBudget = newCheapestINR <= budget;
 
-  // baseline_established: fires exactly once, on a trip's genuine first-ever
-  // check (no prior trip low to compare against) — unconditionally, unlike
-  // every other trigger here, since it's a "monitoring is working, here's
-  // what we found" confirmation rather than a "something notable happened"
-  // alert. Runs alongside whatever else fires below (e.g. budget_reached can
-  // still fire too on the same first check) since they're different signals.
-  if (params.priorTripLow == null) {
-    const underBudget = newCheapestINR <= budget;
+  // baseline_established: fires exactly once, on a trip's first confirmed fare
+  // (no prior best to compare against) — unconditionally, unlike every other
+  // trigger here, since it's a "monitoring is working, here's what we found"
+  // confirmation rather than a "something notable happened" alert.
+  //
+  // If the trip already has recorded prices, this replaces whatever earlier
+  // alerts said, and has to own up to any lower figure the user may be
+  // holding on to: those hadn't been checked against a return flight or the
+  // trip's rules, so they may never have been on offer.
+  if (params.priorBest == null) {
+    const budgetNote = underBudget ? ` (already at or under your ${fmt(budget)} budget).` : `.`;
+    const earlier = params.previouslyRecordedLow;
+    const correction =
+      earlier != null && earlier < newCheapestINR
+        ? ` Earlier figures as low as ${fmt(earlier)} weren't checked against a return flight and your trip rules, so please disregard them.`
+        : "";
+    const lead =
+      earlier != null
+        ? `Updated price for ${tripName}: the cheapest fare with both directions confirmed is`
+        : `Started monitoring ${tripName} — the cheapest fare found so far is`;
     await queueOrSend({
       tripId,
       type: "baseline_established",
-      message:
-        `Started monitoring ${tripName} — cheapest fare found so far is ${fmt(newCheapestINR)} ${typeLabel}` +
-        (underBudget ? ` (already at or under your ${fmt(budget)} budget).` : `.`) +
-        details,
+      message: `${lead} ${fmt(newCheapestINR)} ${typeLabel}${budgetNote}${correction}${coverageNote(params.coverage)}${details}`,
       relatedObservationId: params.cheapest.id,
     });
   }
 
-  // new_low: only meaningful once there's a previous low to beat.
-  if (params.priorTripLow != null && newCheapestINR < params.priorTripLow) {
+  // One better price is one piece of news, however many thresholds it crossed
+  // at once (Principle 3), so it gets one message, saying the most useful
+  // thing it can. The route record is added to a budget crossing, not sent
+  // separately.
+  const alert = chooseFareAlert({
+    newBest: newCheapestINR,
+    budget,
+    priorBest: params.priorBest,
+    priorLow: params.priorLow,
+    priorRouteLow: params.priorRouteLow,
+  });
+  if (alert) {
+    const routeRecord =
+      alert.alsoRouteRecord
+        ? ` That's also the lowest FlySmart has ever recorded on this route.`
+        : "";
+    const messages = {
+      budget_reached: `${tripName} is now ${fmt(newCheapestINR)} ${typeLabel} — at or under your ${fmt(budget)} budget.${routeRecord}`,
+      route_historic_low: `Historically rare: this is the lowest fare FlySmart has ever recorded for ${escapeHtml(params.routeKey)} (${fmt(newCheapestINR)} ${typeLabel}).`,
+      new_low: `New low for ${tripName}: ${fmt(newCheapestINR)} ${typeLabel} (previous low ${fmt(params.priorLow ?? newCheapestINR)}).`,
+    };
     await queueOrSend({
       tripId,
-      type: "new_low",
-      message: `New low for ${tripName}: ${fmt(newCheapestINR)} ${typeLabel} (previous low ${fmt(params.priorTripLow)}).${details}`,
+      type: alert.type,
+      message: `${messages[alert.type]}${details}`,
       relatedObservationId: params.cheapest.id,
     });
   }
 
-  // budget_reached: fire on the crossing transition (or the very first
-  // observation already being under budget), not every subsequent check.
-  if (
-    newCheapestINR <= budget &&
-    (params.priorLastPriceINR == null || params.priorLastPriceINR > budget)
-  ) {
-    await queueOrSend({
-      tripId,
-      type: "budget_reached",
-      message: `${tripName} is now ${fmt(newCheapestINR)} ${typeLabel} — at or under your ${fmt(budget)} budget.${details}`,
-      relatedObservationId: params.cheapest.id,
-    });
-  }
-
-  // route_historic_low: rarer than a trip-scoped low — beats every trip/year
-  // ever tracked for this route.
-  if (params.priorRouteLow != null && newCheapestINR < params.priorRouteLow) {
-    await queueOrSend({
-      tripId,
-      type: "route_historic_low",
-      message: `Historically rare: this is the lowest fare FlySmart has ever recorded for ${escapeHtml(params.routeKey)} (${fmt(newCheapestINR)} ${typeLabel}).${details}`,
-      relatedObservationId: params.cheapest.id,
-    });
-  }
-
-  // price_spike: >=15% up since the last observation.
-  if (params.priorLastPriceINR != null) {
-    const change = (newCheapestINR - params.priorLastPriceINR) / params.priorLastPriceINR;
+  // price_spike: >=15% up on the previous best fare.
+  if (params.priorBest != null) {
+    const change = (newCheapestINR - params.priorBest) / params.priorBest;
     if (change >= 0.15) {
       await queueOrSend({
         tripId,
         type: "price_spike",
-        message: `Price jumped ${(change * 100).toFixed(0)}% for ${tripName} — now ${fmt(newCheapestINR)} ${typeLabel}, up from ${fmt(params.priorLastPriceINR)}.${details}`,
+        message: `Price jumped ${(change * 100).toFixed(0)}% for ${tripName} — now ${fmt(newCheapestINR)} ${typeLabel}, up from ${fmt(params.priorBest)}.${details}`,
         relatedObservationId: params.cheapest.id,
       });
     }
@@ -260,10 +316,12 @@ export async function evaluateTripNotifications(params: {
 
   // window_closing: travel window opens within 21 days and price has never
   // crossed budget. Not tied to one specific fare, so no flight-details block.
+  // The window's start is clamped to today once it has opened, so a daysOut of
+  // 0 means "already open" — there's nothing left to count down to.
   const earliestDeparture = params.trip.travelWindow?.earliestDeparture;
-  if (earliestDeparture && !params.everUnderBudget) {
+  if (earliestDeparture && !params.everUnderBudget && !underBudget) {
     const daysOut = Math.round((earliestDeparture.getTime() - Date.now()) / 86_400_000);
-    if (daysOut >= 0 && daysOut <= 21) {
+    if (daysOut >= 1 && daysOut <= 21) {
       await queueOrSend({
         tripId,
         type: "window_closing",

@@ -86,6 +86,39 @@ const tripSchema = new Schema(
       typicalPriceRangeLow: { type: Number, default: null },
       typicalPriceRangeHigh: { type: Number, default: null },
       checkedAt: { type: Date, default: null },
+      // Google's daily price for the searched dates over the last ~60 days —
+      // real history on day one, instead of waiting months to build our own.
+      priceHistory: {
+        type: [{ _id: false, at: Date, priceINR: Number }],
+        default: [],
+      },
+      // Which search the insight describes. It isn't always the trip itself:
+      // Google gives none for a multi-airport or open-jaw search, so those
+      // come from a plain single-airport search on the same dates.
+      airport: { type: String, default: null },
+      departureDate: { type: Date, default: null },
+      returnDate: { type: Date, default: null },
+      // Open-jaw only: roughly what the same dates cost as a normal round
+      // trip, which is what the open-jaw has to justify itself against.
+      plainRoundTripPriceINR: { type: Number, default: null },
+    },
+    // The best confirmed fare at each poll — one point per check, which is
+    // what "price over time" actually means for a trip spanning many dates.
+    // Raw observations mix every airline and date from every search, so they
+    // can't answer "did it go up?". Notifications and the dashboard read this.
+    bestHistory: {
+      type: [
+        {
+          _id: false,
+          at: { type: Date, required: true },
+          priceINR: { type: Number, required: true },
+          airlines: { type: [String], default: [] },
+          stops: { type: Number, default: 0 },
+          departureDate: { type: Date, default: null },
+          returnDate: { type: Date, default: null },
+        },
+      ],
+      default: [],
     },
   },
   { timestamps: true },

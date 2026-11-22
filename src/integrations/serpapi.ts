@@ -18,6 +18,9 @@ interface FlightItineraryRaw {
   total_duration: number;
   price: number;
   type: string;
+  // Present on the outbound step of a round-trip/multi-city search — the
+  // handle for asking "and which return flights go with this one?"
+  departure_token?: string;
 }
 
 interface GoogleFlightsResponse {
@@ -27,7 +30,11 @@ interface GoogleFlightsResponse {
     lowest_price?: number;
     price_level?: string;
     typical_price_range?: [number, number];
+    // [unix seconds, price] per day, ~60 days back — Google's own record of
+    // this exact search. Only sent for a single-airport, non-multi-city search.
+    price_history?: [number, number][];
   };
+  search_metadata?: { google_flights_url?: string };
   error?: string;
 }
 
@@ -60,6 +67,11 @@ export interface FlightSearchParams {
   // ways) to its multi-city mode, a 2-leg itinerary with its own
   // departure/arrival per leg.
   returnDepartureAirports?: string[];
+  // The trip's own rules, enforced by Google on every leg of the search.
+  // Filtering afterwards can't do this: a round-trip search only ever shows
+  // the outbound leg, so a "1 stop" result could still hide a 3-stop return.
+  maxStops?: number | null;
+  maxLayoverMinutes?: number | null;
 }
 
 export interface NormalizedItinerary {
@@ -76,12 +88,36 @@ export interface NormalizedItinerary {
   // from, when it differs.
   arrivalAirport: string;
   returnDepartureAirport: string | null;
+  durationMinutes: number;
+  // Null for a one-way fare, whose price is already final. Otherwise this
+  // itinerary's price is only a lead until a return is picked with this token
+  // (searchReturnFlights) — see the note on that function.
+  departureToken: string | null;
   raw: FlightItineraryRaw;
 }
 
 export interface FlightSearchResult {
   itineraries: NormalizedItinerary[];
   priceInsights: GoogleFlightsResponse["price_insights"] | null;
+  googleFlightsUrl: string | null;
+}
+
+export interface ReturnFlightOption {
+  price: number;
+  currency: string;
+  airlines: string[];
+  stops: number;
+  layoverMinutes: number[];
+  departureAirport: string;
+  departAt: string | null;
+  arriveAt: string | null;
+  durationMinutes: number;
+  raw: FlightItineraryRaw;
+}
+
+export interface ReturnFlightsResult {
+  options: ReturnFlightOption[];
+  googleFlightsUrl: string | null;
 }
 
 // Splits a multi-city itinerary's concatenated flight segments back into
@@ -100,13 +136,27 @@ export function splitMultiCityLegs(
   return { outbound: flights.slice(0, splitIndex + 1), inbound: flights.slice(splitIndex + 1) };
 }
 
-export async function searchFlights(params: FlightSearchParams): Promise<FlightSearchResult> {
+// The filter values Google Flights expects: 0 any (omitted here), 1 nonstop,
+// 2 one stop or fewer, 3 two stops or fewer. Its minimum layover has to be
+// set alongside the maximum, so 30 minutes stands in for "no real minimum".
+function setConstraintFilters(url: URL, params: FlightSearchParams): void {
+  if (params.maxStops != null) url.searchParams.set("stops", String(params.maxStops + 1));
+  if (params.maxLayoverMinutes != null) {
+    const min = Math.min(30, params.maxLayoverMinutes);
+    url.searchParams.set("layover_duration", `${min},${params.maxLayoverMinutes}`);
+  }
+}
+
+function isOpenJawSearch(params: FlightSearchParams): boolean {
+  return !!params.returnDate && !!params.returnDepartureAirports?.length;
+}
+
+export function buildSearchUrl(params: FlightSearchParams): URL {
   const currency = params.currency ?? "INR";
   const url = new URL("https://serpapi.com/search.json");
   url.searchParams.set("engine", "google_flights");
-  const isOpenJaw = !!params.returnDate && !!params.returnDepartureAirports?.length;
 
-  if (isOpenJaw) {
+  if (isOpenJawSearch(params)) {
     // Google Flights' multi-city mode — an open-jaw round trip is exactly a
     // 2-leg multi-city itinerary: out on departureDate, back on returnDate,
     // each leg with its own airports (confirmed against SerpApi's docs:
@@ -148,16 +198,52 @@ export async function searchFlights(params: FlightSearchParams): Promise<FlightS
   );
   url.searchParams.set("hl", "en");
   url.searchParams.set("api_key", env.serpApiKey);
+  setConstraintFilters(url, params);
+  return url;
+}
 
+// SerpApi reports "this search simply has no flights" through the same error
+// field as a real failure. It's a legitimate answer (a date with nothing that
+// fits the trip's rules) and must not look like a broken search — that would
+// leave the date unverified, to be searched again and again.
+export function isNoResultsError(message: string): boolean {
+  return /hasn't returned any results/i.test(message);
+}
+
+async function fetchGoogleFlights(url: URL, usageCategory: FlightSearchParams["usageCategory"]) {
   const res = await fetch(url.toString());
-  await incrementApiUsage("serpapi", params.usageCategory); // count the call regardless of outcome — it still spent quota
+  await incrementApiUsage("serpapi", usageCategory); // count the call regardless of outcome — it still spent quota
   if (!res.ok) {
     throw new Error(`SerpApi request failed: ${res.status} ${res.statusText}`);
   }
   const data = (await res.json()) as GoogleFlightsResponse;
-  if (data.error) {
+  if (data.error && !isNoResultsError(data.error)) {
     throw new Error(`SerpApi error: ${data.error}`);
   }
+  return data;
+}
+
+// What SerpApi itself says is left this month. The account endpoint doesn't
+// use up a search, and unlike our own count it includes every search made with
+// this key from anywhere else. Null if it can't be reached, so a caller can
+// fall back on the count it keeps.
+export async function fetchSearchesLeft(): Promise<number | null> {
+  try {
+    const url = new URL("https://serpapi.com/account.json");
+    url.searchParams.set("api_key", env.serpApiKey);
+    const res = await fetch(url.toString());
+    if (!res.ok) return null;
+    const account = (await res.json()) as { plan_searches_left?: number };
+    return account.plan_searches_left ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function searchFlights(params: FlightSearchParams): Promise<FlightSearchResult> {
+  const currency = params.currency ?? "INR";
+  const isOpenJaw = isOpenJawSearch(params);
+  const data = await fetchGoogleFlights(buildSearchUrl(params), params.usageCategory);
 
   const all = [...(data.best_flights ?? []), ...(data.other_flights ?? [])];
   // Some itineraries come back with no `price` at all (observed on a real
@@ -180,6 +266,8 @@ export async function searchFlights(params: FlightSearchParams): Promise<FlightS
         layoverMinutes: (it.layovers ?? []).map((l) => l.duration),
         arrivalAirport: outbound[outbound.length - 1]?.arrival_airport.id ?? params.destinationAirports[0],
         returnDepartureAirport: inbound[0]?.departure_airport.id ?? params.returnDepartureAirports![0],
+        durationMinutes: it.total_duration,
+        departureToken: it.departure_token ?? null,
         raw: it,
       };
     }
@@ -191,9 +279,49 @@ export async function searchFlights(params: FlightSearchParams): Promise<FlightS
       layoverMinutes: (it.layovers ?? []).map((l) => l.duration),
       arrivalAirport: it.flights[it.flights.length - 1].arrival_airport.id,
       returnDepartureAirport: null,
+      durationMinutes: it.total_duration,
+      departureToken: it.departure_token ?? null,
       raw: it,
     };
   });
 
-  return { itineraries, priceInsights: data.price_insights ?? null };
+  return {
+    itineraries,
+    priceInsights: data.price_insights ?? null,
+    googleFlightsUrl: data.search_metadata?.google_flights_url ?? null,
+  };
+}
+
+// The second step of a round-trip or open-jaw search: the return flights that
+// can actually be paired with one outbound flight, each with the real total
+// for the whole trip. The price on the outbound step is only Google's guess at
+// that total, and live searches show it can be wrong in either direction
+// (₹42,765 had no return at all; ₹60,871 really cost ₹77,934), so a fare isn't
+// known until this step has been done. Costs one search.
+export async function searchReturnFlights(
+  params: FlightSearchParams,
+  departureToken: string,
+): Promise<ReturnFlightsResult> {
+  const currency = params.currency ?? "INR";
+  const url = buildSearchUrl(params);
+  url.searchParams.set("departure_token", departureToken);
+  const data = await fetchGoogleFlights(url, params.usageCategory);
+
+  const all = [...(data.best_flights ?? []), ...(data.other_flights ?? [])];
+  const options: ReturnFlightOption[] = all
+    .filter((it) => typeof it.price === "number" && it.price > 0)
+    .map((it) => ({
+      price: it.price,
+      currency,
+      airlines: [...new Set(it.flights.map((f) => f.airline))],
+      stops: Math.max(0, it.flights.length - 1),
+      layoverMinutes: (it.layovers ?? []).map((l) => l.duration),
+      departureAirport: it.flights[0].departure_airport.id,
+      departAt: it.flights[0].departure_airport.time ?? null,
+      arriveAt: it.flights[it.flights.length - 1].arrival_airport.time ?? null,
+      durationMinutes: it.total_duration,
+      raw: it,
+    }));
+
+  return { options, googleFlightsUrl: data.search_metadata?.google_flights_url ?? null };
 }

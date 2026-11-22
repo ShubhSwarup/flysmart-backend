@@ -26,6 +26,31 @@ const observationSchema = new Schema({
   // Manila, return departing Cebu). Null for a normal round trip or a
   // one-way fare.
   returnDepartureAirport: { type: String, default: null },
+  // true: the price is the real total for this whole trip — a one-way fare,
+  // or a round trip whose return flight has been picked. false: the outbound
+  // step of a round trip, whose price is only a lead. Unset on anything
+  // recorded before this distinction existed.
+  fareConfirmed: { type: Boolean, default: null },
+  // The return flight behind a confirmed round trip's price.
+  returnLeg: {
+    type: new Schema(
+      {
+        airlines: { type: [String], default: [] },
+        stops: { type: Number, required: true },
+        layoverMinutes: { type: [Number], default: [] },
+        departureAirport: { type: String, required: true },
+        departAt: { type: String, default: null },
+        arriveAt: { type: String, default: null },
+        durationMinutes: { type: Number, default: null },
+      },
+      { _id: false },
+    ),
+    default: null,
+  },
+  durationMinutes: { type: Number, default: null },
+  // Google's own link to this exact search, carrying the real filters and
+  // open-jaw legs — a typed-in query can't reproduce those.
+  googleFlightsUrl: { type: String, default: null },
   cabinClass: { type: String, required: true },
   refundable: { type: Boolean, default: null },
   baggageIncluded: { type: Boolean, default: null },

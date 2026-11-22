@@ -7,7 +7,14 @@ import { getSettings } from "../models/Settings.js";
 import { getMonitoringInfo } from "../services/monitoringService.js";
 import { pollTrip } from "../services/pollService.js";
 import { getCandidateWindow } from "../services/tripWindow.js";
-import { getBestVerifiedCandidate } from "../services/searchCandidateService.js";
+import {
+  getBestVerifiedCandidate,
+  getCoverage,
+  type BestVerifiedCandidate,
+} from "../services/searchCandidateService.js";
+import { resetTripSearch, searchChanged } from "../services/tripService.js";
+import { airportFromRouteKey } from "../services/observationService.js";
+import { buildBookingAdvice, insightCoversDates } from "../services/bookingAdvice.js";
 import { computeWindowOptions, describeOptions } from "../services/daysOffCalculator.js";
 
 export const tripsRouter = Router();
@@ -54,23 +61,83 @@ tripsRouter.post("/days-off-preview", async (req, res) => {
   }
 });
 
+// Everything needed to judge and book the trip's best fare in one place.
+function toBestFare(best: BestVerifiedCandidate) {
+  const { observation: o, candidate, confirmed } = best;
+  const flights = (o.raw as { outbound?: { flights?: unknown[] }; flights?: unknown[] } | undefined);
+  const outboundFlights = (flights?.outbound?.flights ?? flights?.flights ?? []) as {
+    departure_airport?: { time?: string };
+    arrival_airport?: { time?: string };
+  }[];
+  return {
+    priceINR: o.priceINR,
+    confirmed,
+    checkedAt: o.queriedAt,
+    departureDate: candidate.departureDate,
+    returnDate: candidate.returnDate ?? null,
+    arrivalAirport: airportFromRouteKey(o.routeKey),
+    airlines: o.airlines,
+    stops: o.stops,
+    layoverMinutes: o.layoverMinutes,
+    durationMinutes: o.durationMinutes ?? null,
+    departAt: outboundFlights[0]?.departure_airport?.time ?? null,
+    arriveAt: outboundFlights[outboundFlights.length - 1]?.arrival_airport?.time ?? null,
+    returnDepartureAirport: o.returnDepartureAirport ?? null,
+    returnLeg: o.returnLeg ?? null,
+    googleFlightsUrl: o.googleFlightsUrl ?? null,
+  };
+}
+
 async function withMonitoring(trip: InstanceType<typeof Trip>) {
-  const monitoring = await getMonitoringInfo(trip);
+  const tripId = trip._id as Types.ObjectId;
+  const window = getCandidateWindow(trip);
+  const best = window ? await getBestVerifiedCandidate(tripId, window) : null;
+  const coverage = window ? await getCoverage(tripId, window) : null;
+  const bestFare = best ? toBestFare(best) : null;
+  const monitoring = await getMonitoringInfo(trip, bestFare?.priceINR ?? null);
+
   // What to show as "the window this trip is checking" — the dates of the
   // best real result found so far, once there is one (the same "best
   // realistic trip found so far" pollService.ts evaluates notifications
   // against), or the raw window's start as a placeholder before anything's
   // been verified yet. null only when the trip has no resolvable window at
   // all (e.g. every selected flexible month has already elapsed).
-  const window = getCandidateWindow(trip);
-  let effectiveDeparture: Date | null = null;
-  let effectiveReturn: Date | null = null;
-  if (window) {
-    const best = await getBestVerifiedCandidate(trip._id as Types.ObjectId, window);
-    effectiveDeparture = best ? best.candidate.departureDate : window.earliest;
-    effectiveReturn = best ? (best.candidate.returnDate ?? null) : null;
-  }
-  return { ...trip.toObject(), ...monitoring, effectiveDeparture, effectiveReturn };
+  const effectiveDeparture = window ? (bestFare?.departureDate ?? window.earliest) : null;
+  const effectiveReturn = bestFare?.returnDate ?? null;
+  const daysUntilTravel = window
+    ? Math.max(0, Math.ceil((window.earliest.getTime() - Date.now()) / 86_400_000))
+    : null;
+
+  const insightApplies =
+    bestFare != null &&
+    insightCoversDates(trip.lastPriceInsight, bestFare.departureDate, bestFare.returnDate);
+
+  const advice = buildBookingAdvice({
+    bestPriceINR: bestFare?.priceINR ?? null,
+    confirmed: bestFare?.confirmed ?? false,
+    budgetINR: trip.budget?.amount ?? 0,
+    coverage,
+    insight: insightApplies ? (trip.lastPriceInsight ?? null) : null,
+    bestPrices: (trip.bestHistory ?? []).map((point) => point.priceINR),
+    longestLayoverMinutes: Math.max(
+      0,
+      ...(bestFare?.layoverMinutes ?? []),
+      ...(bestFare?.returnLeg?.layoverMinutes ?? []),
+    ),
+    daysUntilTravel,
+    openJawReturnAirports: trip.openJawReturnAirports,
+  });
+
+  return {
+    ...trip.toObject(),
+    ...monitoring,
+    effectiveDeparture,
+    effectiveReturn,
+    windowStart: window?.earliest ?? null,
+    bestFare,
+    coverage,
+    advice,
+  };
 }
 
 tripsRouter.get("/", async (req, res) => {
@@ -113,20 +180,26 @@ tripsRouter.get("/:id/candidates", async (req, res) => {
       departureDate: { $gte: window.earliest, $lte: window.latest },
     }).sort({ departureDate: 1 });
     const observationIds = candidates
-      .map((c) => c.observationId)
+      .flatMap((c) => [c.observationId, c.confirmedObservationId])
       .filter((id): id is Types.ObjectId => id != null);
     const observations = await Observation.find({ _id: { $in: observationIds } });
     const observationById = new Map(observations.map((o) => [String(o._id), o]));
 
     res.json(
       candidates.map((c) => {
-        const observation = c.observationId ? observationById.get(String(c.observationId)) : undefined;
+        const confirmed = c.confirmedObservationId
+          ? observationById.get(String(c.confirmedObservationId))
+          : undefined;
+        const lead = c.observationId ? observationById.get(String(c.observationId)) : undefined;
+        const observation = confirmed ?? lead;
         return {
           departureDate: c.departureDate,
           returnDate: c.returnDate,
           status: c.status,
           estimatedPriceINR: c.estimatedPriceINR,
           priceINR: observation?.priceINR ?? null,
+          confirmed: confirmed != null,
+          noBookableReturn: c.noBookableReturn ?? false,
           stops: observation?.stops ?? null,
           airlines: observation?.airlines ?? [],
           returnDepartureAirport: observation?.returnDepartureAirport ?? null,
@@ -158,11 +231,22 @@ tripsRouter.post("/", async (req, res) => {
 
 tripsRouter.patch("/:id", async (req, res) => {
   try {
+    const before = await Trip.findById(req.params.id);
+    if (!before) return res.status(404).json({ error: "Trip not found" });
     const trip = await Trip.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
       runValidators: true,
     });
     if (!trip) return res.status(404).json({ error: "Trip not found" });
+
+    // A changed search means nothing found so far describes this trip any
+    // more. Same immediate re-baseline a new trip gets.
+    if (searchChanged(before, trip)) {
+      await resetTripSearch(trip._id);
+      const fresh = await Trip.findById(trip._id);
+      if (fresh?.status === "active") await pollTrip(fresh);
+      return res.json(await withMonitoring((await Trip.findById(trip._id))!));
+    }
     res.json(await withMonitoring(trip));
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -173,6 +257,7 @@ tripsRouter.delete("/:id", async (req, res) => {
   try {
     const trip = await Trip.findByIdAndDelete(req.params.id);
     if (!trip) return res.status(404).json({ error: "Trip not found" });
+    await SearchCandidate.deleteMany({ tripId: trip._id });
     res.status(204).end();
   } catch {
     res.status(400).json({ error: "Invalid trip id" });

@@ -1,9 +1,7 @@
 // Whether an itinerary satisfies a trip's stated stop/layover constraints.
-// Applied when choosing which itinerary represents "this trip's cheapest
-// fare" for notifications — never when recording observations, since every
-// itinerary a search returns is still recorded regardless of whether this
-// specific trip would accept it, preserving full route-level history
-// (Section 3.4) even for itineraries this trip's own filters would reject.
+// Google already applies these as search filters (serpapi.ts), so this is the
+// backstop that also covers the return leg once it's known, and any provider
+// or older observation that wasn't filtered.
 export interface TripConstraints {
   maxStops?: number | null;
   maxLayoverMinutes?: number | null;
@@ -30,4 +28,32 @@ export function withinTripConstraints(
     return false;
   }
   return true;
+}
+
+// Long enough that it stops being a connection and becomes part of the plan.
+// Allowed unless the trip says otherwise, but never left unmentioned.
+export const LONG_LAYOVER_MINUTES = 360;
+
+// Paying this little extra is always worth it for at least this much less
+// time travelling — the real case behind it: Philippine Airlines at ₹64,089
+// with a 22-hour layover beat Cathay Pacific at ₹64,412 with a 3.5-hour one.
+const NEAR_TIE_PRICE_RATIO = 1.05;
+const NEAR_TIE_MINUTES_SAVED = 180;
+
+interface ComparableFare {
+  price: number;
+  durationMinutes: number;
+}
+
+// Cheapest first, except that a near-tie goes to the much shorter journey. A
+// truly cheaper long journey stays first — that's the trip-owner's call, made
+// visible by the layover warning, not something to hide from them.
+export function rankFares<T extends ComparableFare>(fares: T[]): T[] {
+  const byPrice = [...fares].sort((a, b) => a.price - b.price || a.durationMinutes - b.durationMinutes);
+  const cheapest = byPrice[0];
+  if (!cheapest) return byPrice;
+  const nearTies = byPrice.filter((fare) => fare.price <= cheapest.price * NEAR_TIE_PRICE_RATIO);
+  const shortest = nearTies.reduce((a, b) => (b.durationMinutes < a.durationMinutes ? b : a));
+  if (cheapest.durationMinutes - shortest.durationMinutes < NEAR_TIE_MINUTES_SAVED) return byPrice;
+  return [shortest, ...byPrice.filter((fare) => fare !== shortest)];
 }
